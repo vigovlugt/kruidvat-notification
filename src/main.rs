@@ -1,6 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
-use color_eyre::{eyre::format_err, Result};
+use color_eyre::{eyre::format_err, Report, Result};
 use cron::Schedule;
 use dotenv::dotenv;
 use scraper::{Html, Selector};
@@ -29,7 +29,19 @@ async fn main() -> Result<()> {
 
         println!("Checking for product availability");
 
-        let sale = get_sale(&product_url).await?;
+        let sale = get_sale(&product_url).await;
+
+        let sale = match sale {
+            Ok(sale) => sale,
+            Err(e) => {
+                println!("Error: {}", e);
+                match send_error_mail(e).await {
+                    Ok(_) => {}
+                    Err(e) => println!("Error sending error mail: {}", e),
+                }
+                continue;
+            }
+        };
 
         let sale = match sale {
             Some(sale) => sale,
@@ -41,7 +53,10 @@ async fn main() -> Result<()> {
 
         println!("Sale found: {:?}", sale);
 
-        send_mail(sale).await?;
+        match send_mail(sale).await {
+            Ok(_) => {}
+            Err(e) => println!("Error sending mail: {}", e),
+        }
     }
 }
 
@@ -146,6 +161,47 @@ async fn send_mail(data: (String, f32, f32)) -> Result<()> {
     }
 
     println!("Mail sent to {}", mailgun_to);
+
+    Ok(())
+}
+
+async fn send_error_mail(data: Report) -> Result<()> {
+    let _ = dotenv();
+    let mailgun_api_key = std::env::var("MAILGUN_API_KEY").expect("MAILGUN_API_KEY must be set.");
+    let mailgun_domain = std::env::var("MAILGUN_DOMAIN").expect("MAILGUN_DOMAIN must be set.");
+    let mailgun_from = std::env::var("MAILGUN_FROM").expect("MAILGUN_FROM must be set.");
+    let mailgun_to = std::env::var("MAILGUN_ERROR_TO").expect("MAILGUN_ERROR_TO must be set.");
+
+    let product_url = std::env::var("PRODUCT_URL").expect("PRODUCT_URL must be set.");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .gzip(true)
+        .build()?;
+
+    let res = client
+        .post(&format!(
+            "https://api.mailgun.net/v3/{}/messages",
+            mailgun_domain
+        ))
+        .basic_auth("api", Some(mailgun_api_key))
+        .form(&[
+            ("from", mailgun_from),
+            ("to", mailgun_to.to_owned()),
+            (
+                "subject",
+                format!("ERROR: kruidvat-notification failed for {}", product_url).to_owned(),
+            ),
+            ("text", format!("{}\n{:#?}", product_url, data).to_owned()),
+        ])
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        return Err(format_err!("Failed to send mail: {}", res.status()));
+    }
+
+    println!("Error mail sent to {}", mailgun_to);
 
     Ok(())
 }
