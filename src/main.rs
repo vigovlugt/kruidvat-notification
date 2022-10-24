@@ -3,16 +3,24 @@ use std::{str::FromStr, time::Duration};
 use color_eyre::{eyre::format_err, Report, Result};
 use cron::Schedule;
 use dotenv::dotenv;
+use reqwest::Client;
 use scraper::{Html, Selector};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenv();
+
     let product_url = std::env::var("PRODUCT_URL").expect("PRODUCT_URL must be set.");
     let cron = std::env::var("CRON").expect("CRON must be set.");
-    println!("Checking {} every {}", product_url, cron);
 
     let schedule = Schedule::from_str(&cron)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .gzip(true)
+        .build()?;
+
+    println!("Checking {} every {}", product_url, cron);
 
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -29,13 +37,25 @@ async fn main() -> Result<()> {
 
         println!("Checking for product availability");
 
-        let sale = get_sale(&product_url).await;
+        let product_data = get_product_data(&client, &product_url).await;
+        let special_sale = get_special_sale(&client, &product_url).await;
 
-        let sale = match sale {
+        let product_data = match product_data {
             Ok(sale) => sale,
             Err(e) => {
                 println!("Error: {}", e);
-                match send_error_mail(e).await {
+                match send_error_mail(&client, e).await {
+                    Ok(_) => {}
+                    Err(e) => println!("Error sending error mail: {}", e),
+                }
+                continue;
+            }
+        };
+        let special_sale = match special_sale {
+            Ok(sale) => sale,
+            Err(e) => {
+                println!("Error: {}", e);
+                match send_error_mail(&client, e).await {
                     Ok(_) => {}
                     Err(e) => println!("Error sending error mail: {}", e),
                 }
@@ -43,30 +63,84 @@ async fn main() -> Result<()> {
             }
         };
 
-        let sale = match sale {
-            Some(sale) => sale,
+        // If there is a discount
+        match product_data.2 {
+            Some(old_price) => {
+                println!("Sale found: {:?}", product_data);
+
+                match send_mail(
+                    &client,
+                    (product_data.0.to_owned(), product_data.1, old_price),
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(e) => println!("Error sending mail: {}", e),
+                }
+            }
             None => {
                 println!("No sale found.");
-                continue;
             }
         };
 
-        println!("Sale found: {:?}", sale);
+        match special_sale {
+            Some(special_sale) => {
+                println!("Special sale found: {:?}", special_sale);
 
-        match send_mail(sale).await {
-            Ok(_) => {}
-            Err(e) => println!("Error sending mail: {}", e),
+                match send_special_sale_mail(&client, product_data.0, special_sale).await {
+                    Ok(_) => {}
+                    Err(e) => println!("Error sending mail: {}", e),
+                }
+            }
+            None => {
+                println!("No special sale found.");
+            }
         }
     }
 }
 
-async fn get_sale(product_url: &str) -> Result<Option<(String, f32, f32)>> {
-    println!("Getting sale for {}", product_url);
+async fn get_special_sale(client: &Client, product_url: &str) -> Result<Option<String>> {
+    println!("Getting special sale for {}", product_url);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .gzip(true)
-        .build()?;
+    let product_id = product_url
+        .split('/')
+        .last()
+        .ok_or_else(|| format_err!("Invalid product url"))?;
+    let url = format!("https://www.kruidvat.nl/view/PromotionBoxComponentController?componentUid=PromotionBoxComponent&currentProductCode={}", product_id);
+
+    let res = client.get(url).send().await?;
+    if !res.status().is_success() {
+        return Err(format_err!(
+            "Failed to get special sale url: {}",
+            res.status()
+        ));
+    }
+
+    let body = res.text().await?;
+    if body.is_empty() {
+        return Ok(None);
+    }
+
+    let document = Html::parse_document(&body);
+
+    let sale_name = document
+        .select(&Selector::parse(".promotion-box__information-text").unwrap())
+        .next()
+        .ok_or_else(|| format_err!("Failed to find sale name"))?
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned();
+
+    Ok(Some(sale_name))
+}
+
+async fn get_product_data(
+    client: &Client,
+    product_url: &str,
+) -> Result<(String, f32, Option<f32>)> {
+    println!("Getting sale for {}", product_url);
 
     let res = client.get(product_url).send().await?;
     if !res.status().is_success() {
@@ -102,26 +176,26 @@ async fn get_sale(product_url: &str) -> Result<Option<(String, f32, f32)>> {
     let old_price = document
         .select(&Selector::parse(".pricebadge__old-price-content").unwrap())
         .next();
+
     let old_price = match old_price {
-        Some(old_price) => old_price,
-        None => return Ok(None),
+        Some(old_price) => Some(
+            old_price
+                .text()
+                .collect::<Vec<_>>()
+                .join("")
+                .replace("\n", "")
+                .replace(" ", "")
+                .replace(",", ".")
+                .to_string()
+                .parse::<f32>()?,
+        ),
+        None => None,
     };
 
-    let old_price = old_price
-        .text()
-        .collect::<Vec<_>>()
-        .join("")
-        .replace("\n", "")
-        .replace(" ", "")
-        .replace(",", ".")
-        .to_string()
-        .parse::<f32>()?;
-
-    return Ok(Some((name, price, old_price)));
+    Ok((name, price, old_price))
 }
 
-async fn send_mail(data: (String, f32, f32)) -> Result<()> {
-    let _ = dotenv();
+async fn send_special_sale_mail(client: &Client, product_name: String, data: String) -> Result<()> {
     let mailgun_api_key = std::env::var("MAILGUN_API_KEY").expect("MAILGUN_API_KEY must be set.");
     let mailgun_domain = std::env::var("MAILGUN_DOMAIN").expect("MAILGUN_DOMAIN must be set.");
     let mailgun_from = std::env::var("MAILGUN_FROM").expect("MAILGUN_FROM must be set.");
@@ -129,10 +203,40 @@ async fn send_mail(data: (String, f32, f32)) -> Result<()> {
 
     let product_url = std::env::var("PRODUCT_URL").expect("PRODUCT_URL must be set.");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .gzip(true)
-        .build()?;
+    let res = client
+        .post(&format!(
+            "https://api.mailgun.net/v3/{}/messages",
+            mailgun_domain
+        ))
+        .basic_auth("api", Some(mailgun_api_key))
+        .form(&[
+            ("from", mailgun_from),
+            ("to", mailgun_to.to_owned()),
+            (
+                "subject",
+                format!("{} in de aanbieding: {}", product_name, data).to_owned(),
+            ),
+            ("text", format!("{}", product_url).to_owned()),
+        ])
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        return Err(format_err!("Failed to send mail: {}", res.status()));
+    }
+
+    println!("Mail sent to {}", mailgun_to);
+
+    Ok(())
+}
+
+async fn send_mail(client: &Client, data: (String, f32, f32)) -> Result<()> {
+    let mailgun_api_key = std::env::var("MAILGUN_API_KEY").expect("MAILGUN_API_KEY must be set.");
+    let mailgun_domain = std::env::var("MAILGUN_DOMAIN").expect("MAILGUN_DOMAIN must be set.");
+    let mailgun_from = std::env::var("MAILGUN_FROM").expect("MAILGUN_FROM must be set.");
+    let mailgun_to = std::env::var("MAILGUN_TO").expect("MAILGUN_TO must be set.");
+
+    let product_url = std::env::var("PRODUCT_URL").expect("PRODUCT_URL must be set.");
 
     let res = client
         .post(&format!(
@@ -165,19 +269,13 @@ async fn send_mail(data: (String, f32, f32)) -> Result<()> {
     Ok(())
 }
 
-async fn send_error_mail(data: Report) -> Result<()> {
-    let _ = dotenv();
+async fn send_error_mail(client: &Client, data: Report) -> Result<()> {
     let mailgun_api_key = std::env::var("MAILGUN_API_KEY").expect("MAILGUN_API_KEY must be set.");
     let mailgun_domain = std::env::var("MAILGUN_DOMAIN").expect("MAILGUN_DOMAIN must be set.");
     let mailgun_from = std::env::var("MAILGUN_FROM").expect("MAILGUN_FROM must be set.");
     let mailgun_to = std::env::var("MAILGUN_ERROR_TO").expect("MAILGUN_ERROR_TO must be set.");
 
     let product_url = std::env::var("PRODUCT_URL").expect("PRODUCT_URL must be set.");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .gzip(true)
-        .build()?;
 
     let res = client
         .post(&format!(
