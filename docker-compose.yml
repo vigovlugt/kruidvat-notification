@@ -1,0 +1,10 @@
+services:
+  kruidvat-notification:
+    build: .
+    environment:
+      - PRODUCT_URL=${PRODUCT_URL}
+      - MAILGUN_API_KEY=${MAILGUN_API_KEY}
+      - MAILGUN_DOMAIN=${MAILGUN_DOMAIN}
+      - MAILGUN_FROM=${MAILGUN_FROM}
+      - MAILGUN_TO=${MAILGUN_TO}
+      - CRON=${CRON}
