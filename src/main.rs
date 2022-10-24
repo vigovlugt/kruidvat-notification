@@ -192,7 +192,7 @@ async fn send_error_mail(data: Report) -> Result<()> {
                 "subject",
                 format!("ERROR: kruidvat-notification failed for {}", product_url).to_owned(),
             ),
-            ("text", format!("{}\n{:#?}", product_url, data).to_owned()),
+            ("text", format!("{}\n{}", product_url, data).to_owned()),
         ])
         .send()
         .await?;
