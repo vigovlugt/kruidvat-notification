@@ -685,6 +685,7 @@ dependencies = [
  "dotenv",
  "reqwest",
  "scraper",
+ "serde_json",
  "tokio",
 ]
 

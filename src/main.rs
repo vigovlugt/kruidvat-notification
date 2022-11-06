@@ -22,6 +22,9 @@ async fn main() -> Result<()> {
 
     println!("Checking {} every {}", product_url, cron);
 
+    // (IS_IN_ACTION, IS_IN_STOCK)
+    let mut last_state = (false, false);
+
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -39,6 +42,7 @@ async fn main() -> Result<()> {
 
         let product_data = get_product_data(&client, &product_url).await;
         let special_sale = get_special_sale(&client, &product_url).await;
+        let in_stock = get_stock(&client, &product_url).await;
 
         let product_data = match product_data {
             Ok(sale) => sale,
@@ -62,40 +66,60 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-
-        // If there is a discount
-        match product_data.2 {
-            Some(old_price) => {
-                println!("Sale found: {:?}", product_data);
-
-                match send_mail(
-                    &client,
-                    (product_data.0.to_owned(), product_data.1, old_price),
-                )
-                .await
-                {
+        let in_stock = match in_stock {
+            Ok(sale) => sale,
+            Err(e) => {
+                println!("Error: {}", e);
+                match send_error_mail(&client, e).await {
                     Ok(_) => {}
-                    Err(e) => println!("Error sending mail: {}", e),
+                    Err(e) => println!("Error sending error mail: {}", e),
                 }
-            }
-            None => {
-                println!("No sale found.");
+                continue;
             }
         };
 
-        match special_sale {
-            Some(special_sale) => {
-                println!("Special sale found: {:?}", special_sale);
+        // If there is a discount
+        match last_state {
+            (true, true) => {}
+            _ => {
+                if in_stock {
+                    match product_data.2 {
+                        Some(old_price) => {
+                            println!("Sale found: {:?}", product_data);
 
-                match send_special_sale_mail(&client, product_data.0, special_sale).await {
-                    Ok(_) => {}
-                    Err(e) => println!("Error sending mail: {}", e),
+                            match send_mail(
+                                &client,
+                                (product_data.0.to_owned(), product_data.1, old_price),
+                            )
+                            .await
+                            {
+                                Ok(_) => {}
+                                Err(e) => println!("Error sending mail: {}", e),
+                            }
+                        }
+                        None => {
+                            println!("No sale found.");
+                        }
+                    };
+
+                    match &special_sale {
+                        Some(special_sale) => {
+                            println!("Special sale found: {:?}", special_sale);
+
+                            match send_special_sale_mail(&client, product_data.0).await {
+                                Ok(_) => {}
+                                Err(e) => println!("Error sending mail: {}", e),
+                            }
+                        }
+                        None => {
+                            println!("No special sale found.");
+                        }
+                    }
                 }
             }
-            None => {
-                println!("No special sale found.");
-            }
         }
+
+        last_state = (product_data.2.is_some() || special_sale.is_some(), in_stock);
     }
 }
 
@@ -134,6 +158,42 @@ async fn get_special_sale(client: &Client, product_url: &str) -> Result<Option<S
         .to_owned();
 
     Ok(Some(sale_name))
+}
+
+async fn get_stock(client: &Client, product_url: &str) -> Result<bool> {
+    println!("Getting stock for {}", product_url);
+
+    let product_id = product_url
+        .split('/')
+        .last()
+        .ok_or_else(|| format_err!("Invalid product url"))?;
+    let url = format!(
+        "https://www.kruidvat.nl/api/v2/kvn/products/{}/onlinestock",
+        product_id
+    );
+
+    let res = client
+        .get(url)
+        .header("accept", "application/json")
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        return Err(format_err!(
+            "Failed to get special sale url: {}",
+            res.status()
+        ));
+    }
+
+    let body = res.text().await?;
+
+    let stock: serde_json::Value = serde_json::from_str(&body)?;
+    let stock = stock["stockLevelStatus"]
+        .as_str()
+        .ok_or_else(|| format_err!("Failed to parse stock: {}", stock))?;
+
+    let in_stock = stock != "outOfStock";
+
+    Ok(in_stock)
 }
 
 async fn get_product_data(
@@ -195,7 +255,7 @@ async fn get_product_data(
     Ok((name, price, old_price))
 }
 
-async fn send_special_sale_mail(client: &Client, product_name: String, data: String) -> Result<()> {
+async fn send_special_sale_mail(client: &Client, product_name: String) -> Result<()> {
     let mailgun_api_key = std::env::var("MAILGUN_API_KEY").expect("MAILGUN_API_KEY must be set.");
     let mailgun_domain = std::env::var("MAILGUN_DOMAIN").expect("MAILGUN_DOMAIN must be set.");
     let mailgun_from = std::env::var("MAILGUN_FROM").expect("MAILGUN_FROM must be set.");
@@ -214,7 +274,7 @@ async fn send_special_sale_mail(client: &Client, product_name: String, data: Str
             ("to", mailgun_to.to_owned()),
             (
                 "subject",
-                format!("{} in de aanbieding: {}", product_name, data).to_owned(),
+                format!("{} is in de actie", product_name).to_owned(),
             ),
             ("text", format!("{}", product_url).to_owned()),
         ])
@@ -251,7 +311,7 @@ async fn send_mail(client: &Client, data: (String, f32, f32)) -> Result<()> {
                 "subject",
                 format!(
                     "{} in de aanbieding van €{} voor €{}",
-                    data.0, data.2, data.1
+                    data.0, data.2, data.1,
                 )
                 .to_owned(),
             ),
