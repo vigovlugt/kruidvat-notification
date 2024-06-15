@@ -1,10 +1,9 @@
-use std::{str::FromStr, time::Duration};
-
 use color_eyre::{eyre::format_err, Report, Result};
 use cron::Schedule;
 use dotenv::dotenv;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use std::{str::FromStr, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,7 +15,7 @@ async fn main() -> Result<()> {
     let schedule = Schedule::from_str(&cron)?;
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        // .timeout(Duration::from_secs(10))
         .gzip(true)
         .build()?;
 
@@ -40,14 +39,12 @@ async fn main() -> Result<()> {
 
         println!("Checking for product availability");
 
-        let product_data = get_product_data(&client, &product_url).await;
-        let special_sale = get_special_sale(&client, &product_url).await;
-        let in_stock = get_stock(&client, &product_url).await;
-
+        let product_data: std::result::Result<(String, f32, Option<f32>), Report> =
+            get_product_data(&product_url).await;
         let product_data = match product_data {
             Ok(sale) => sale,
             Err(e) => {
-                println!("Error: {}", e);
+                println!("Error product data: {}", e);
                 match send_error_mail(&client, e).await {
                     Ok(_) => {}
                     Err(e) => println!("Error sending error mail: {}", e),
@@ -55,6 +52,8 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+
+        let special_sale = get_special_sale(&product_url).await;
         let special_sale = match special_sale {
             Ok(sale) => sale,
             Err(e) => {
@@ -66,6 +65,8 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+
+        let in_stock = get_stock(&product_url).await;
         let in_stock = match in_stock {
             Ok(sale) => sale,
             Err(e) => {
@@ -123,7 +124,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn get_special_sale(client: &Client, product_url: &str) -> Result<Option<String>> {
+async fn get_special_sale(product_url: &str) -> Result<Option<String>> {
     println!("Getting special sale for {}", product_url);
 
     let product_id = product_url
@@ -132,7 +133,7 @@ async fn get_special_sale(client: &Client, product_url: &str) -> Result<Option<S
         .ok_or_else(|| format_err!("Invalid product url"))?;
     let url = format!("https://www.kruidvat.nl/view/PromotionBoxComponentController?componentUid=PromotionBoxComponent&currentProductCode={}", product_id);
 
-    let res = client.get(url).send().await?;
+    let mut res = surf::get(url).await.map_err(|e| format_err!("{}", e))?;
     if !res.status().is_success() {
         return Err(format_err!(
             "Failed to get special sale url: {}",
@@ -140,7 +141,7 @@ async fn get_special_sale(client: &Client, product_url: &str) -> Result<Option<S
         ));
     }
 
-    let body = res.text().await?;
+    let body = res.body_string().await.map_err(|e| format_err!("{}", e))?;
     if body.is_empty() {
         return Ok(None);
     }
@@ -160,7 +161,7 @@ async fn get_special_sale(client: &Client, product_url: &str) -> Result<Option<S
     Ok(Some(sale_name))
 }
 
-async fn get_stock(client: &Client, product_url: &str) -> Result<bool> {
+async fn get_stock(product_url: &str) -> Result<bool> {
     println!("Getting stock for {}", product_url);
 
     let product_id = product_url
@@ -172,11 +173,7 @@ async fn get_stock(client: &Client, product_url: &str) -> Result<bool> {
         product_id
     );
 
-    let res = client
-        .get(url)
-        .header("accept", "application/json")
-        .send()
-        .await?;
+    let mut res = surf::get(url).await.map_err(|e| format_err!("{}", e))?;
     if !res.status().is_success() {
         return Err(format_err!(
             "Failed to get special sale url: {}",
@@ -184,7 +181,7 @@ async fn get_stock(client: &Client, product_url: &str) -> Result<bool> {
         ));
     }
 
-    let body = res.text().await?;
+    let body = res.body_string().await.map_err(|e| format_err!("{}", e))?;
 
     let stock: serde_json::Value = serde_json::from_str(&body)?;
     let stock = stock["stockLevelStatus"]
@@ -196,18 +193,17 @@ async fn get_stock(client: &Client, product_url: &str) -> Result<bool> {
     Ok(in_stock)
 }
 
-async fn get_product_data(
-    client: &Client,
-    product_url: &str,
-) -> Result<(String, f32, Option<f32>)> {
+async fn get_product_data(product_url: &str) -> Result<(String, f32, Option<f32>)> {
     println!("Getting sale for {}", product_url);
 
-    let res = client.get(product_url).send().await?;
+    let mut res = surf::get(product_url)
+        .await
+        .map_err(|e| format_err!("{}", e))?;
     if !res.status().is_success() {
         return Err(format_err!("Failed to get product page: {}", res.status()));
     }
 
-    let html = res.text().await?;
+    let html = res.body_string().await.map_err(|e| format_err!("{}", e))?;
     let document = Html::parse_document(&html);
 
     let name = document
